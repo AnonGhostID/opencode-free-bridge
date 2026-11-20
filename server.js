@@ -3573,7 +3573,14 @@ if (require.main === module) {
       .catch(() => {});
   }
   warp.armIdleKill();
-  const exitCleanup = () => warp.shutdown();
+  // Registering a SIGINT/SIGTERM handler disables Bun's default kill, so the
+  // handler has to terminate the process itself or a listening server hangs
+  // through Ctrl+C. warp.shutdown is sync (it only kills the helper child and
+  // clears timers), so nothing here can delay the exit.
+  const exitCleanup = (signal) => {
+    warp.shutdown();
+    process.exit(0);
+  };
   process.on("exit", exitCleanup);
   process.on("SIGINT", exitCleanup);
   process.on("SIGTERM", exitCleanup);
