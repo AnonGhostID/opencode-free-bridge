@@ -152,17 +152,12 @@ async function load() {
 }
 
 async function send(path, payload) {
-  setBusy(true);
-  try {
-    const res = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return await readJson(res);
-  } finally {
-    setBusy(false);
-  }
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return await readJson(res);
 }
 
 const warpOn = $("warp-on");
@@ -277,6 +272,7 @@ warpOn.addEventListener("click", async () => {
   } catch (err) {
     showWarpReport([line(err.message, "bad")]);
     warpOn.disabled = false;
+    warpOff.disabled = false;
   }
 });
 
@@ -291,6 +287,7 @@ warpOff.addEventListener("click", async () => {
   } catch (err) {
     showWarpReport([line(err.message, "bad")]);
     warpOff.disabled = false;
+    warpOn.disabled = false;
   }
 });
 
