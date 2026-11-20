@@ -34,6 +34,8 @@ const WARP_ATTEMPTS = 4;
 const KEY_ROTATE_ATTEMPT = 3;
 const PROBE_MAX_ATTEMPTS = 40;
 const PROBE_RETRY_MS = 250;
+const TUNNEL_READY_TIMEOUT_MS = 20_000;
+const TUNNEL_READY_PROBE_MS = 6_000;
 const METRICS_HANDSHAKE_TIMEOUT_MS = 5_000;
 const METRICS_HANDSHAKE_RETRIES = 10;
 const METRICS_HANDSHAKE_RETRY_MS = 500;
@@ -432,13 +434,26 @@ async function startTunnel(device) {
     lastWorkingEndpoint = null;
   });
 
-  for (let attempt = 0; attempt < PROBE_MAX_ATTEMPTS; attempt += 1) {
+  // "Tunnel up" must mean the WireGuard session, not just a TCP listener:
+  // before the handshake, wireproxy accepts CONNECT but dials fail inside
+  // the tunnel, and probing then can surface a socket that bypassed the
+  // tunnel and reported the direct exit IP. Gate on a confirmed WARP IP.
+  const directIp = await directExitIp(Date.now() + EXIT_IP_TIMEOUT_MS);
+  if (directIp) emitProgress(`direct exit ip: ${directIp}`);
+  const probeDeadline = Date.now() + TUNNEL_READY_TIMEOUT_MS;
+  for (;;) {
     if (child.exitCode !== null) break;
     if (await portReachable(bindPort)) {
-      lastWorkingEndpoint = endpoint;
-      emitProgress("tunnel up");
-      return true;
+      const ip = await tunnelExitIp(`http://127.0.0.1:${bindPort}`, TUNNEL_READY_PROBE_MS);
+      if (ip && ip !== directIp) {
+        lastWorkingEndpoint = endpoint;
+        lastExitIp = ip;
+        emitProgress("tunnel up (handshake confirmed)");
+        return true;
+      }
+      // TCP listener without a completed handshake yet: keep waiting.
     }
+    if (Date.now() >= probeDeadline) break;
     await new Promise((r) => setTimeout(r, PROBE_RETRY_MS));
   }
   await stopTunnel();
@@ -730,12 +745,11 @@ async function setEnabled(next) {
   emitProgress(`device ${device.id} ready (${device.address6 ?? device.address4})`);
   if (!(await ensureHelper())) return { ok: false, enabled: false, error: "wireproxy helper unavailable" };
   if (!(await startTunnel(device))) return { ok: false, enabled: false, error: "tunnel did not start" };
-  // Sample the exit IP once so /health and the panel can show it instead of
-  // null until the first rotation; a failed probe stays null on purpose.
-  const initialExitIp = await tunnelExitIp(egressUrl(), ROTATION_PROBE_TIMEOUT_MS);
-  if (initialExitIp) {
-    lastExitIp = initialExitIp;
-    emitProgress(`connected. exit ip: ${initialExitIp}`);
+  // startTunnel confirmed the handshake and sampled the exit IP, so report
+  // it here with the direct IP for comparison; any leak is visible at once.
+  if (lastExitIp) {
+    const directIp = await directExitIp(Date.now() + EXIT_IP_TIMEOUT_MS);
+    emitProgress(`connected. exit ip: ${lastExitIp}${directIp ? ` (direct: ${directIp})` : ""}`);
     const health = await probeIpHealth(egressUrl());
     lastExitHealth = health.state;
     lastExitHealthStatus = health.status;
