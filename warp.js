@@ -277,14 +277,17 @@ async function downloadHelper() {
       const actual = crypto.createHash("sha256").update(archive).digest("hex");
       if (actual !== expected) throw new Error("checksum mismatch");
     }
-    const archivePath = path.join(warpHome(), archiveName);
-    fs.writeFileSync(archivePath, archive);
-    const extraction = spawnSync("tar", ["-xzf", archivePath, "-C", warpHome()], {
-      encoding: "utf8",
+    // GNU tar parses `C:\...` as `host:path` (remote host `C`), which is how
+    // Windows downloads fail with "Cannot connect to C: resolve failed". Pipe
+    // the archive through stdin instead, so tar never sees a drive letter.
+    const extraction = spawnSync("tar", ["-xzf", "-", "-C", warpHome()], {
+      encoding: "buffer",
+      input: archive,
+      maxBuffer: 64 * 1024 * 1024,
     });
-    fs.rmSync(archivePath, { force: true });
     if (extraction.status !== 0) {
-      throw new Error(`tar: ${String(extraction.stderr || "").trim().split("\n")[0]}`);
+      const stderr = extraction.stderr ? Buffer.from(extraction.stderr).toString("utf8") : "";
+      throw new Error(`tar: ${stderr.trim().split("\n")[0] || `exit ${extraction.status}`}`);
     }
     if (!fs.existsSync(helperPath())) throw new Error("unpacked but missing");
     // chmod is a no-op on Windows filesystems that ignore the POSIX bits.
