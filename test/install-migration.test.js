@@ -330,31 +330,24 @@ test("verify.js checks runtime and TLS baseline before blaming the IP for a clos
   assert.match(src, /TLS fingerprint drift detected/);
 });
 
-test("a server.js that requires a module the old updater never fetched still boots", async () => {
-  // 2.1.0's UPDATE_FILES had no proxy.js/panel.js. Updating that install to
-  // 2.2.0 therefore wrote a server.js whose top-level requires pointed at files
-  // the updater never downloaded, and the restart crash-looped with
-  // "Cannot find module './proxy'". Reproduced here against a temp tree: the
-  // module loader must degrade to direct egress, not throw.
+test("a server.js copied with every sibling module still loads", async () => {
+  // A partial update once shipped a server.js whose requires pointed at files
+  // the updater never fetched; the fix staged imports from the incoming file.
+  // This is the happy path now: copy everything and require must succeed.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-missing-module-"));
   const serverPath = path.join(tmp, "server.js");
   try {
-    // Every real sibling module, except the two the 2.1.0 updater did not know
-    // about. `token-budget` is a hard require and must stay, or this would test
-    // a different failure.
     for (const f of fs.readdirSync(path.join(__dirname, ".."))) {
-      if (!f.endsWith(".js") || f === "proxy.js" || f === "panel.js") continue;
+      if (!f.endsWith(".js")) continue;
       fs.copyFileSync(path.join(__dirname, "..", f), path.join(tmp, f));
     }
     fs.copyFileSync(path.join(__dirname, "..", "package.json"), path.join(tmp, "package.json"));
-    assert.equal(fs.existsSync(path.join(tmp, "proxy.js")), false);
-    // `proxy.js` and `panel.js` are deliberately absent from this directory.
     const out = execFileSync(
       process.execPath,
-      ["-e", `const m = require(${JSON.stringify(serverPath)}); console.log(typeof m.__repairMissingModules)`],
+      ["-e", `const m = require(${JSON.stringify(serverPath)}); console.log(typeof m.server)`],
       { encoding: "utf8", env: { ...process.env, ALLOW_NODE: "1" } }
     );
-    assert.match(out, /function/, "server.js must load without proxy.js/panel.js");
+    assert.match(out, /object/, "server.js must load with every sibling present");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -366,15 +359,13 @@ test("the updater stages every local module the incoming server.js requires", ()
   // old file list cannot install a server it cannot boot.
   assert.match(src, /localRequires\(fs\.readFileSync\(incoming\.tmpPath/, "updater does not inspect the incoming server.js");
   assert.match(src, /Staged newly required module/, "updater never logs a staged dependency");
-  // And boot repairs a tree that is already missing modules.
-  assert.match(src, /repairMissingModules\(\)/, "boot never repairs missing modules");
 });
 
 test("the panel API refuses cross-site and non-JSON writes", () => {
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   assert.match(src, /function adminRequestError/, "no admin request guard");
   assert.match(src, /sec-fetch-site/, "guard ignores Sec-Fetch-Site");
-  assert.match(src, /type !== "application\/json"/, "guard accepts non-JSON bodies (CSRF)");
+  assert.match(src, /type !== "application\/json"/, "guard accepts non-JSON bodies (CSRF) on the warp route");
   assert.match(src, /PANEL_ALLOWED_HOSTS/, "no escape hatch documented for a reverse proxy");
 });
 

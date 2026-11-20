@@ -36,7 +36,6 @@
     "transport-baseline.json",
     "tunnel-doctor.sh",
     "warp.js",
-    "proxy.js",
     "panel.js"
   ],
   "keywords": [

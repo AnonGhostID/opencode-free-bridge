@@ -28,7 +28,7 @@ It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible
 Bun is required to talk to the live OpenCode gateway. Node.js 18+ can run the offline unit test suite, but upstream rejects Node.js requests with `403 FreeTierError` because Node's OpenSSL TLS `ClientHello` differs from the compiled OpenCode CLI (which is built on Bun/BoringSSL). The installer installs Bun for you when it is missing.
 
 Supported: Linux (systemd) and macOS (launchd). On Windows, run it under WSL2
-or Docker Desktop. The core bridge (server, panel, proxy, pool) is plain
+or Docker Desktop. The core bridge (server, panel, WARP egress) is plain
 JavaScript and runs wherever Bun runs; the WARP helper is downloaded for
 Windows too, but `install.sh` does not set up a native Windows service, and
 Bun's TLS fingerprint on Windows is not part of the recorded baseline, so gate
@@ -105,8 +105,9 @@ uncommitted or unpushed files) instead of downloading from GitHub. Force a
 download with `SOURCE=remote bash install.sh`.
 
 The server listens on `http://127.0.0.1:20129` by default.
-Open `http://127.0.0.1:20129/` for the panel: it shows the live egress state and sets
-an HTTP proxy for every outbound request. See [Egress proxy](#egress-proxy).
+Open `http://127.0.0.1:20129/` for the panel: it shows the live egress state
+and toggles the WARP tunnel for every outbound request. See
+[WARP egress](#warp-egress).
 
 ### Docker
 
@@ -475,8 +476,7 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `OPENCODE_CHAT_URL` | _(derived)_ | Override the upstream Chat Completions endpoint URL |
 | `OPENCODE_RESPONSES_URL` | _(derived)_ | Override the upstream Responses API endpoint URL |
 | `UPSTREAM_RELAY_URL` | _(unset)_ | Route inference through an egress relay (`x-relay-target` / `x-relay-path` contract); empty = direct. See [Optional egress relay](#optional-egress-relay) |
-| `UPSTREAM_PROXY_URL` | _(unset)_ | Operator-level default for the egress proxy (`http://[user:pass@]host:port`). When set it wins over the panel and locks runtime edits. See [Egress proxy](#egress-proxy) |
-| `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
+| `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/warp` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
 | `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
 | `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
 
@@ -492,175 +492,12 @@ UPSTREAM_RELAY_URL="https://relay.example.workers.dev" bun server.js
 ```
 
 The relay covers inference requests and their retries; model discovery and
-identity synchronization stay direct. `/health` reports `egress.mode` (`direct`
-or `relay`) and the relay's origin, without credentials or query strings. Use a
+identity synchronization stay direct. `/health` reports `egress.mode`
+(`warp` when the WARP toggle is on, otherwise `direct`) and the relay's
+origin, without credentials or query strings. Use a
 trusted HTTPS relay: it receives the request headers (including
 `Authorization: Bearer public`) and the full prompt. Changing the variable
 requires a restart.
-
-### Egress proxy
-
-Open `http://127.0.0.1:20129/` and enter an HTTP proxy. Every outbound request
-the bridge makes then tunnels through it (`CONNECT`), so upstream sees the
-proxy's IP rather than this machine's. That covers inference, model discovery,
-identity sync, and the self-updater.
-
-- **Protocol:** `http://` and `https://` only. Bun's fetch accepts those and
-  tunnels TLS itself, so `transport-baseline.json` still matches. SOCKS5 is
-  refused by Bun (`UnsupportedProxyProtocol`) and rejected in the panel with
-  that reason.
-- **Credentials:** `http://user:pass@host:port`, percent-encoded if they contain
-  `@`, `:`, or `/`. They are stored in `~/.opencode-free-bridge/proxy.json`
-  (mode `0600`) and never returned by the panel, `/api/proxy`, or `/health`;
-  those show `host:port` only.
-- **Test before trusting it:** *Uji koneksi* fetches the models endpoint through
-  the candidate proxy and reports the exit IP from `cdn-cgi/trace`. A 403 there
-  means the proxy reaches upstream but its egress is refused.
-- **No restart:** the setting is read on every request. *Matikan proxy* returns
-  to direct egress.
-- **Operator override:** `UPSTREAM_PROXY_URL` beats the panel and locks runtime
-  edits to it.
-- **Only from this machine:** the panel and `/api/proxy` accept `Host` names of
-  loopback (or the configured bind address) plus anything in
-  `PANEL_ALLOWED_HOSTS`, reject cross-site requests, and require
-  `Content-Type: application/json` for writes. That blocks a random website from
-  re-pointing your egress and blocks DNS rebinding. Put a reverse proxy in front
-  and add its name to `PANEL_ALLOWED_HOSTS` if you reach the panel that way.
-- **Container:** the compose file mounts the `bridge-state` volume at
-  `/data/state` (`OPENCODE_BRIDGE_STATE_DIR`) so the setting survives a
-  recreate. Plain `docker run` needs that env var and volume too.
-
-### WARP egress
-
-`bun server.js` can also carry every upstream request through a Cloudflare
-WARP tunnel, so upstream sees a WARP egress instead of this machine's address.
-The switch lives in the panel section "WARP egress" and takes effect on the
-next request without a restart; off (the default) leaves everything else as it
-was. While it is on, the pool and the single proxy are bypassed, and a quota
-refusal rotates the device instead of walking the pool.
-
-How it works, one process, no extra service:
-
-- A device is registered with Cloudflare once and cached at
-  `<state dir>/warp/warp-device.json` (mode `0600`); `warp/warp-state.json`
-  reflects the switch position but never re-activates at boot: `bun
-  server.js` always starts with WARP off, and the device, burned networks
-  and helper survive restarts. `warp/warp-burned.json` holds the networks
-  that already refused (24 h TTL, 500 entries), `warp/warp.log` the rotation
-  log.
-- The `wireproxy` helper (`pufferffish/wireproxy` v1.1.3) is downloaded once,
-  verified against `checksums.txt`, unpacked into `warp/`, and run as a child
-  process bound to a loopback HTTP port; Bun tunnels HTTPS through it via
-  `CONNECT`, so the recorded TLS fingerprint is unchanged.
-- A `429 FreeUsageLimitError` triggers up to 4 WARP attempts (key rotation on
-  attempt 3, device replacement on attempt 4) and one retry, 1 s after a
-  successful rotation and 5 s after a failed one. Cloudflare's registration
-  rate limit parks registration for 60 s.
-
-The API mirrors the panel: `GET /api/warp` reads the state, `POST /api/warp`
-with `{"enabled": true|false}` switches it, and `/health` carries the current
-`warp` object plus `egress.mode: "warp"`. Setting `UPSTREAM_PROXY_URL` locks
-the operator egress and refusing WARP overrides it.
-
-The tunnel carries only opencode.ai traffic. WARP registration and rotation
-automate a free Cloudflare consumer service; that is a policy risk the
-operator accepts.
-
-### Egress pool
-
-The free-tier allowance is per egress IP, not per account. Running one bridge
-per host multiplies processes, service units and tunnels without giving anything
-a pool does not: the pool rotates the egress while one process keeps the
-identity, the catalog and the session cache in one place.
-
-A pool is a list of egress entries. Each keeps its own health, so an entry that
-upstream throttles is skipped until its cooldown ends instead of being retried
-by every request.
-
-```bash
-# in the panel under "Pool egress", one entry per line
-med1=http://pool:token@127.0.0.1:20251
-med2=http://pool:token@127.0.0.1:20252
-```
-
-```bash
-# operator override: comma- or newline-separated, label=url optional
-UPSTREAM_PROXY_POOL="med1=http://a:1,med2=http://b:2" \
-UPSTREAM_PROXY_STRATEGY=failover \
-  bun server.js
-```
-
-- **Entry shape:** a URL string, `{id,label,url,enabled,weight}`, or
-  `{direct: true}` for this machine's own address. `direct` is a first-class
-  entry, so the hosting IP can take part in the rotation instead of being the
-  fallback used only when every proxy is down.
-- **Strategies:** `round-robin` (default; even spread across healthy entries),
-  `failover` (sticky on the first healthy entry, which keeps upstream prompt
-  caching on one IP), `random` (weighted).
-- **Cooldown:** a refusal on a pooled egress is recorded against *that* entry.
-  The backoff doubles per consecutive failure from `cooldownMs` (default 120 s)
-  up to `maxCooldownMs` (default 30 min); a success resets it. A `429` earns four
-  times the base window because it is an unambiguous allowance answer.
-- **Always sends:** when every entry is cooling, the one that recovers first is
-  used anyway. Refusing would turn a throttled pool into a dead bridge, and
-  upstream answers a throttled IP with a normal refusal the caller already
-  handles.
-- **Failover on a gate rejection:** the bridge drops the entry that was refused
-  and retries through a different one, in the same request. An unreachable proxy
-  is also failed over, since nothing reached upstream.
-- **One egress per request:** the protocol-lane, endpoint-migration, 5xx and
-  gate retries all reuse the entry the request started on, because upstream ties
-  a retry to the address that saw the first attempt. Only the two cases above
-  move it.
-- **`/health`** reports `egress.mode: "pool"` and `egress.proxy.pool` with each
-  entry's host, state, remaining cooldown and failure count. Credentials are
-  never included.
-
-#### Health across restarts
-
-Cooldowns are written to `<state dir>/pool-health.json` (mode `0600`), so a
-service restart or a host suspend/resume does not forget which IPs are spent and
-re-burn all of them.
-
-- A refusal is written immediately; a success is coalesced over one second,
-  because a success arrives with every request and a rewrite per request would
-  turn a memory update into disk churn.
-- The file is written by rename, so a crash mid-write keeps the previous copy
-  instead of leaving a truncated one that would cost every cooldown.
-- Records are keyed by a truncated SHA-256 of the egress identity, not by URL,
-  so the file is not a second copy of the proxy credentials. A `label` field
-  carries `host:port` (or `direct`), which `/health` already exposes.
-- Saving the pool in the panel keeps existing cooldowns; only an entry that
-  leaves the pool loses its record.
-- A corrupt or missing health file costs the cooldowns and nothing else: the
-  bridge starts, reports the pool from `proxy.json`, and treats every entry as
-  ready.
-
-#### Turning a host into a pool member
-
-`egress-proxy.js` is a dependency-free HTTP proxy for exactly this: it answers
-`CONNECT` and absolute-URI HTTP, and forwards bytes without inspecting them.
-Its TLS is tunneled end to end, so it never sees plaintext.
-
-```bash
-# on the node
-PORT=8888 EGRESS_PROXY_TOKEN=secret bun egress-proxy.js
-
-# from the bridge host: put it on a loopback port, so the proxy itself is never
-# exposed and the tunnel carries the authentication
-ssh -L 127.0.0.1:20251:127.0.0.1:8888 node
-```
-
-`/healthz` is unauthenticated on purpose: it reports a connection count and an
-uptime, nothing about the target or the token, so a monitor does not need the
-credential to ask whether the proxy is up.
-
-`/health` reports `egress.mode` (`pool`, `proxy`, `relay`, or `direct`) plus
-`egress.proxy` with the same credential-free description.
-
-The proxy applies *in addition to* the relay: with both configured, the request
-is still sent to `UPSTREAM_RELAY_URL`, and that connection is dialled through
-the proxy.
 
 ## Troubleshooting
 
