@@ -57,7 +57,7 @@ const TUNNEL_DOMAIN_SUFFIXES = [".opencode.ai"];
 // so an unknown host never breaks a caller that should not be tunneled.
 const BURNED_WRITE_DEBOUNCE_MS = 1_000;
 const MAX_LOG_BYTES = 1 * 1024 * 1024;
-const DEFAULT_IDLE_KILL_MS = 30_000;
+const IDLE_REAP_MS = 30_000;
 
 function warpHome() {
   const raw = process.env.OPENCODE_WARP_HOME;
@@ -701,9 +701,9 @@ let metricsPort = 0;
 let helperVerified = false;
 let helperVerifiedAt = 0;
 let rotationInFlight = null;
-let idleKillTimer = null;
 let currentProxyUrlValue = null;
 let tunnelProxyUrl = null;
+let idleKillTimer = null;
 
 function currentProxyUrl() {
   return currentProxyUrlValue;
@@ -798,19 +798,15 @@ function armIdleKill() {
   clearTimeout(idleKillTimer);
   idleKillTimer = setTimeout(() => {
     idleKillTimer = null;
-    if (!enabled) return;
-    if (tunnelProc && Date.now() - lastTunnelUse > DEFAULT_IDLE_KILL_MS) {
-      appendLog("idle tunnel reaped");
+    // The toggle owns tunnel lifetime: while WARP is enabled the tunnel is
+    // the egress and must survive idle periods; the reap below only closes a
+    // stray tunnel left behind after the toggle was turned off.
+    if (!enabled && tunnelProc) {
+      emitProgress("idle tunnel reaped");
       stopTunnel();
     }
     armIdleKill();
-  }, DEFAULT_IDLE_KILL_MS);
-}
-
-let lastTunnelUse = 0;
-
-function noteTunnelUse() {
-  lastTunnelUse = Date.now();
+  }, IDLE_REAP_MS);
 }
 
 function persistRuntime() {
@@ -921,7 +917,6 @@ module.exports = {
   describe,
   shutdown,
   noteExitIp,
-  noteTunnelUse,
   ensureHelper,
   helperArchiveName,
   helperBinaryName,
