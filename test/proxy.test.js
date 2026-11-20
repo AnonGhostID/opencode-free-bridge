@@ -327,6 +327,21 @@ describe("panel document", () => {
     assert.match(html, /&lt;img src=x/);
   });
 
+  it("status host line names the carrier per mode, never a stale placeholder", () => {
+    for (const [mode, proxy, expected] of [
+      ["warp", "http://1.2.3.4:8080", "tunnel WARP"],
+      ["proxy", "http://1.2.3.4:8080", "http://1.2.3.4:8080"],
+      ["direct", "http://1.2.3.4:8080", "IP mesin ini"],
+    ]) {
+      const html = panel.renderPanel({ mode, proxy, pool: { active: false, entries: [] } }, { version: "2.0.3", port: 20129 });
+      // Assert on the rendered document, not the client script source: a
+      // comment may legitimately name the removed placeholder string.
+      const body = html.replace(/<script>[\s\S]*?<\/script>/, "").replace(/<style>[\s\S]*?<\/style>/, "");
+      assert.ok(body.includes(expected), `mode ${mode} should render "${expected}"`);
+      assert.equal(body.includes("tidak ada proxy"), false, `mode ${mode} must not render the stale placeholder`);
+    }
+  });
+
   it("ships no dead controls: every button has a matching listener", () => {
     const html = panel.renderPanel({ mode: "direct" });
     for (const id of ["save", "test", "direct"]) {

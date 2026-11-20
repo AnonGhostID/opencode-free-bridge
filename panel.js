@@ -187,7 +187,14 @@ function renderStatus(state) {
           ? "WARP (IP tersembunyi)"
           : "Langsung (IP asli)";
   $("mode").dataset.mode = state.mode === "direct" ? "direct" : "proxy";
-  $("host").textContent = state.proxy || "tidak ada proxy";
+  // The host span describes the active egress. With WARP on, the proxy
+  // config is intentionally bypassed, so "tidak ada proxy" would contradict
+  // the mode label; name the actual carrier instead.
+  if (state.mode === "warp") $("host").textContent = "tunnel WARP";
+  else if (state.mode === "pool" && state.pool && state.pool.active) $("host").textContent = state.pool.enabled + " entri pool";
+  else if (state.mode === "pool") $("host").textContent = "pool";
+  else if (state.mode === "proxy") $("host").textContent = state.proxy;
+  else $("host").textContent = "IP mesin ini";
   const notes = [];
   if (state.locked) notes.push("Dikunci " + state.source + ": ubah variabel environment lalu restart.");
   if (state.hasCredentials) notes.push("Kredensial tersimpan, tidak ditampilkan.");
@@ -606,7 +613,7 @@ function renderPanel(description, { version = "", port = "" } = {}) {
     <h2 id="status-title">Status sekarang</h2>
     <div class="status">
       <span class="mode" id="mode">${escapeHtml(state.mode === "pool" ? "Pool aktif" : state.mode === "proxy" ? "Lewat proxy" : state.mode === "warp" ? "WARP (IP tersembunyi)" : "Langsung (IP asli)")}</span>
-      <span class="host" id="host">${escapeHtml(state.proxy || "tidak ada proxy")}</span>
+      <span class="host" id="host">${escapeHtml(state.mode === "proxy" ? state.proxy : state.mode === "pool" ? "pool" : state.mode === "warp" ? "tunnel WARP" : "IP mesin ini")}</span>
       <span class="note" id="note" hidden></span>
     </div>
     <ul class="pool-list" id="pool-list" hidden></ul>
