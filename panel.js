@@ -179,7 +179,13 @@ function setBusy(busy) {
 
 function renderStatus(state) {
   $("mode").textContent =
-    state.mode === "pool" ? "Pool aktif" : state.mode === "proxy" ? "Lewat proxy" : "Langsung (IP asli)";
+    state.mode === "pool"
+      ? "Pool aktif"
+      : state.mode === "proxy"
+        ? "Lewat proxy"
+        : state.mode === "warp"
+          ? "WARP (IP tersembunyi)"
+          : "Langsung (IP asli)";
   $("mode").dataset.mode = state.mode === "direct" ? "direct" : "proxy";
   $("host").textContent = state.proxy || "tidak ada proxy";
   const notes = [];
@@ -275,7 +281,12 @@ async function readJson(res) {
 
 async function load() {
   try {
-    const state = await readJson(await fetch("/api/proxy"));
+    // egress.mode in /health is the authoritative view of what actually
+    // carries upstream traffic (pool/proxy/relay/warp/direct); proxyState
+    // alone cannot see WARP, which is a toggle, not a proxy config.
+    const health = await readJson(await fetch("/health"));
+    const proxyState = await readJson(await fetch("/api/proxy"));
+    const state = { ...proxyState, mode: health.egress.mode };
     renderStatus(state);
 
     // Prefill the pool editor from the live config so an operator can edit an
@@ -448,6 +459,7 @@ function openWarpStream() {
       const data = JSON.parse(event.data);
       pushWarpLine(data.message);
       if (/warp enabled|connected/.test(data.message)) {
+        load();
         loadWarp();
         closeWarpStream();
       }
@@ -593,7 +605,7 @@ function renderPanel(description, { version = "", port = "" } = {}) {
   <section aria-labelledby="status-title">
     <h2 id="status-title">Status sekarang</h2>
     <div class="status">
-      <span class="mode" id="mode">${escapeHtml(state.mode === "pool" ? "Pool aktif" : state.mode === "proxy" ? "Lewat proxy" : "Langsung (IP asli)")}</span>
+      <span class="mode" id="mode">${escapeHtml(state.mode === "pool" ? "Pool aktif" : state.mode === "proxy" ? "Lewat proxy" : state.mode === "warp" ? "WARP (IP tersembunyi)" : "Langsung (IP asli)")}</span>
       <span class="host" id="host">${escapeHtml(state.proxy || "tidak ada proxy")}</span>
       <span class="note" id="note" hidden></span>
     </div>
