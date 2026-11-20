@@ -48,6 +48,7 @@ const EXIT_IP_URLS = [
   "https://api.ipify.org",
   "https://checkip.amazonaws.com",
 ];
+const HEALTH_PROBE_TIMEOUT_MS = 20_000;
 const TUNNEL_HOST_ALLOWLIST = new Set(["opencode.ai", "models.opencode.ai", "cdn.opencode.ai"]);
 const TUNNEL_DOMAIN_SUFFIXES = [".opencode.ai"];
 // A tunnel destination not in the allowlist is answered directly (no WARP),
@@ -567,6 +568,37 @@ async function probeCurrentAddress() {
   return proxyUrl ? tunnelExitIp(proxyUrl, ROTATION_PROBE_TIMEOUT_MS) : directExitIp(deadline);
 }
 
+/**
+ * Ask the live gateway whether this exit IP still has free-tier allowance.
+ * The probe uses the inference endpoint, so a 429 is the authoritative "this
+ * IP is spent" answer; any other status or a network error is not an IP
+ * verdict and reads as unknown (the gate can refuse shapes, not just IPs).
+ */
+async function probeIpHealth(proxyUrl) {
+  const init = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "big-pickle",
+      max_tokens: 1,
+      stream: false,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+    signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
+  };
+  try {
+    const res = await fetch("https://opencode.ai/inference/v1/chat/completions", {
+      ...init,
+      proxy: proxyUrl,
+    });
+    if (res.status === 429) return { state: "dirty", status: 429 };
+    if (res.ok) return { state: "clean", status: res.status };
+    return { state: "unknown", status: res.status };
+  } catch (err) {
+    return { state: "unknown", status: null, error: err.message };
+  }
+}
+
 async function directExitIp(deadline) {
   for (const url of EXIT_IP_URLS) {
     try {
@@ -704,6 +736,16 @@ async function setEnabled(next) {
   if (initialExitIp) {
     lastExitIp = initialExitIp;
     emitProgress(`connected. exit ip: ${initialExitIp}`);
+    const health = await probeIpHealth(egressUrl());
+    lastExitHealth = health.state;
+    lastExitHealthStatus = health.status;
+    emitProgress(
+      health.state === "clean"
+        ? "ip health: clean"
+        : health.state === "dirty"
+          ? "ip health: dirty (quota already spent on this IP; rotate or wait for reset)"
+          : `ip health: unknown (HTTP ${health.status ?? "network error"})`
+    );
   }
   enabled = true;
   persistRuntime();
@@ -721,7 +763,13 @@ function describe() {
         ? { id: readDevice().id, address: readDevice().address6 ?? readDevice().address4 }
         : null,
     tunnel: tunnelProc
-      ? { port: tunnelPort, endpoint: tunnelEndpoint, exitIp: lastExitIp }
+      ? {
+          port: tunnelPort,
+          endpoint: tunnelEndpoint,
+          exitIp: lastExitIp,
+          ipHealth: lastExitHealth,
+          ipHealthStatus: lastExitHealthStatus,
+        }
       : null,
     egressUrl: egressUrl(),
     burned: burned.size,
@@ -763,6 +811,10 @@ function persistRuntime() {
 }
 
 function restoreRuntime() {
+  // Reset first: a persisted "enabled" from the previous process must not
+  // make the boot's setEnabled(true) hit the no-op branch and skip tunnel
+  // startup ("WARP tunnel up on null").
+  enabled = false;
   try {
     const parsed = JSON.parse(fs.readFileSync(path.join(warpHome(), "warp-state.json"), "utf8"));
     enabled = Boolean(parsed?.enabled);
@@ -822,9 +874,15 @@ function metricsPortForTest(port) {
 }
 
 let lastExitIp = null;
+let lastExitHealth = null;
+let lastExitHealthStatus = null;
 
 function setLastExitIpForTest(ip) {
   lastExitIp = ip;
+}
+
+function setExitHealthForTest(state) {
+  lastExitHealth = state;
 }
 
 async function noteExitIp(ip) {
@@ -865,12 +923,14 @@ module.exports = {
   tunnelExitIp,
   directExitIp,
   probeCurrentAddress,
+  probeIpHealth,
   armIdleKill,
   restoreRuntime,
   persistRuntime,
   appendLog,
   metricsPortForTest,
   setLastExitIpForTest,
+  setExitHealthForTest,
   helperPath,
   warpHome,
   deviceFile,
