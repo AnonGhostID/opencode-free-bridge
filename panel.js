@@ -62,6 +62,7 @@ section { margin-bottom: 32px; }
 }
 .status .mode { font-weight: 600; }
 .status .mode[data-mode="proxy"] { color: var(--ok); }
+.status .mode[data-warp="on"] { color: var(--ok); }
 .status .host { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9375rem; }
 .status .note { color: var(--muted); font-size: 0.875rem; width: 100%; }
 .field { margin-bottom: 20px; }
@@ -359,6 +360,72 @@ function showPoolReport(nodes) {
   box.hidden = false;
 }
 
+const warpOn = $("warp-on");
+const warpOff = $("warp-off");
+const warpMode = $("warp-mode");
+const warpHost = $("warp-host");
+const warpNote = $("warp-note");
+
+function showWarpReport(nodes) {
+  const box = $("warp-report");
+  box.replaceChildren(...nodes);
+  box.hidden = false;
+}
+
+function renderWarp(state) {
+  const on = state.enabled;
+  warpMode.textContent = on ? "WARP aktif" : "WARP mati";
+  warpMode.dataset.warp = on ? "on" : "off";
+  warpHost.textContent = state.tunnel
+    ? "port " + state.tunnel.port + " via " + (state.tunnel.endpoint || "?")
+    : on
+      ? "tunnel tidak aktif"
+      : "";
+  const notes = [];
+  if (state.device) notes.push("device " + state.device.id);
+  if (state.burned) notes.push(state.burned + " jaringan dibuang");
+  if (state.rateLimitedUntil) notes.push("rate limited sementara");
+  if (state.error) notes.push(state.error);
+  warpNote.textContent = notes.join(" · ");
+  warpNote.hidden = notes.length === 0;
+  warpOn.disabled = on;
+  warpOff.disabled = !on;
+}
+
+async function loadWarp() {
+  try {
+    renderWarp(await readJson(await fetch("/api/warp")));
+  } catch (err) {
+    showWarpReport([line("Gagal memuat status WARP: " + err.message, "bad")]);
+  }
+}
+
+warpOn.addEventListener("click", async () => {
+  warpOn.disabled = true;
+  warpOff.disabled = true;
+  try {
+    const state = await send("/api/warp", { enabled: true });
+    renderWarp(state);
+    showWarpReport([line(state.ok ? "WARP aktif. Request berikutnya keluar lewat tunnel." : "WARP gagal dinyalakan: " + (state.error || "?"), state.ok ? "ok" : "bad")]);
+  } catch (err) {
+    showWarpReport([line(err.message, "bad")]);
+    warpOn.disabled = false;
+  }
+});
+
+warpOff.addEventListener("click", async () => {
+  warpOn.disabled = true;
+  warpOff.disabled = true;
+  try {
+    const state = await send("/api/warp", { enabled: false });
+    renderWarp(state);
+    showWarpReport([line("WARP mati. Egress kembali ke pool, proxy, atau langsung.", "ok")]);
+  } catch (err) {
+    showWarpReport([line(err.message, "bad")]);
+    warpOff.disabled = false;
+  }
+});
+
 $("pool-save").addEventListener("click", async () => {
   const entries = readPoolInput();
   if (entries.length === 0) {
@@ -416,6 +483,7 @@ $("pool-clear").addEventListener("click", async () => {
 });
 
 load();
+loadWarp();
 `;
 
 function escapeHtml(value) {
@@ -496,6 +564,21 @@ function renderPanel(description, { version = "", port = "" } = {}) {
       </div>
       <div class="report" id="report" role="status" aria-live="polite" hidden></div>
     </form>
+  </section>
+
+  <section aria-labelledby="warp-title">
+    <h2 id="warp-title">WARP egress</h2>
+    <div class="status">
+      <span class="mode" id="warp-mode" data-warp="off">WARP mati</span>
+      <span class="host" id="warp-host"></span>
+      <span class="note" id="warp-note" hidden></span>
+    </div>
+    <p class="hint">Saat aktif, semua request keluar menuju upstream lewat tunnel WARP. Entri pool dan proxy tunggal diabaikan sampai WARP dimatikan lagi.</p>
+    <div class="actions">
+      <button type="button" class="primary" id="warp-on">Nyalakan WARP</button>
+      <button type="button" id="warp-off">Matikan WARP</button>
+    </div>
+    <div class="report" id="warp-report" role="status" aria-live="polite" hidden></div>
   </section>
 
   <section aria-labelledby="endpoint-title">

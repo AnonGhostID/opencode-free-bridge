@@ -26,6 +26,7 @@ try {
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
 const { handleAnthropicMessages, handleCountTokens } = require("./anthropic");
+const warp = require("./warp");
 
 /**
  * Load a sibling module, or a fallback when the file is not on disk yet.
@@ -224,6 +225,7 @@ const UPDATE_FILES = [
   "proxy.js",
   "panel.js",
   "egress-proxy.js",
+  "warp.js",
   "anthropic.js",
   "server.js",
   "THIRD_PARTY_NOTICES.md",
@@ -457,6 +459,10 @@ function syncUserAgent() {
  * Without it, a pool picks per call.
  */
 function upstreamFetch(url, init, egressUrl = null) {
+  if (warp.isEnabled() && !egressUrl) {
+    const tunnelUrl = warp.egressUrl();
+    if (tunnelUrl) return proxy.netFetch(url, init, tunnelUrl);
+  }
   if (!UPSTREAM_RELAY_URL) return proxy.netFetch(url, init, egressUrl);
   const parsed = new URL(url);
   const headers = { ...(init.headers || {}) };
@@ -766,14 +772,17 @@ async function discoverModels() {
         `[opencode-free-bridge] Gateway price list re-ruled: ${promoted.slice(0, 6).join(", ")}${promoted.length > 6 ? ` (+${promoted.length - 6})` : ""}`
       );
     }
-    const ownedBy = new Map(items.map((i) => [String(i.id || "").toLowerCase(), i]));
     const kept = [];
     const seen = new Set();
-    const keep = (id) => {
-      const lower = String(id).toLowerCase();
-      if (seen.has(lower)) return;
+    // Keep the gateway's own record, not just its id: clients read
+    // `limit.context`, `modalities`, `capabilities` and `cost` from /v1/models
+    // to size requests and pick endpoints, and upstream already publishes all
+    // of it. Rebuilding a 3-field stub here threw that data away.
+    const keep = (item) => {
+      const lower = String(item?.id || "").toLowerCase();
+      if (!lower || seen.has(lower)) return;
       seen.add(lower);
-      kept.push(id);
+      kept.push(item);
     };
     // Only ids the gateway is serving right now are advertised: a catalog-free
     // model missing from /models is retired, and advertising it sends clients
@@ -784,20 +793,20 @@ async function discoverModels() {
       if (lower.startsWith("jev-")) continue; // systemone evaluator models
       const verdict = identity.getCatalogVerdict(lower);
       if (verdict === "free") {
-        keep(id);
+        keep(item);
         continue;
       }
       if (verdict) continue; // paid or deprecated, and the gateway agrees
       // No ruling at all: the catalog has not been read yet in this process.
       // Guess from the name, then correct itself on the next refresh.
       if (!lower.endsWith("-free") && !lower.includes("-contributor") && lower !== "big-pickle") continue;
-      keep(id);
+      keep(item);
     }
 
-    const freeItems = kept.map((id) => ({
-      id,
-      object: "model",
-      owned_by: ownedBy.get(String(id).toLowerCase())?.owned_by || "opencode",
+    const freeItems = kept.map((item) => ({
+      ...item,
+      object: item.object || "model",
+      owned_by: item.owned_by || "opencode",
     }));
 
     if (freeItems.length > 0) {
@@ -1958,7 +1967,7 @@ function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
 }
 
 // --- HTTP Server ---
-function handleRequest(req, res) {
+async function handleRequest(req, res) {
   req.on("error", (err) => {
     console.warn("[opencode-free-bridge] request stream error:", err.message);
   });
@@ -2040,6 +2049,45 @@ function handleRequest(req, res) {
     return;
   }
 
+  if (pathname === "/api/warp") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(denied.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: denied.error }));
+      return;
+    }
+    if (req.method === "GET" || req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(warp.describe()));
+      return;
+    }
+    if (req.method === "POST") {
+      let payload = {};
+      try {
+        const text = await readRequestBody(req, 4 * 1024);
+        payload = text ? JSON.parse(text) : {};
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Body tidak valid: ${err.message}` }));
+        return;
+      }
+      if (typeof payload.enabled !== "boolean") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Body harus berisi 'enabled': true|false." }));
+        return;
+      }
+      const result = await warp.setEnabled(payload.enabled);
+      const status = result.ok ? 200 : 400;
+      res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: result.ok, ...warp.describe(), error: result.error ?? null }));
+      console.log(`[opencode-free-bridge] WARP ${result.ok ? (result.enabled ? "on" : "off") : "refused"}${result.error ? `: ${result.error}` : ""}`);
+      return;
+    }
+    res.writeHead(405, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Gunakan GET untuk status atau POST untuk mengubah." }));
+    return;
+  }
+
   // Health check
   if (pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2073,12 +2121,24 @@ function handleRequest(req, res) {
                 ? "proxy"
                 : UPSTREAM_RELAY_URL
                   ? "relay"
-                  : "direct",
+                  : warp.isEnabled()
+                    ? "warp"
+                    : "direct",
           ...(UPSTREAM_RELAY_URL ? { relay: relayLabel(UPSTREAM_RELAY_URL) } : {}),
           proxy: proxyState,
           // Per-egress wire traffic and token accounting (usage.json). The
           // phone entry here is the mobile-data cost of the bridge today.
           ...(usageView ? { usage: usageView } : {}),
+        },
+        // One WARP egress, toggle-driven. `warp` is null-shaped when off so
+        // consumers that only check enabled do not chase nested objects.
+        warp: {
+          enabled: warp.isEnabled(),
+          egressUrl: warp.egressUrl(),
+          tunnel: warp.describe().tunnel,
+          burned: warp.describe().burned,
+          device: warp.describe().device,
+          rateLimitedUntil: warp.describe().rateLimitedUntil,
         },
         identity: {
           userAgent: idState.userAgent,
@@ -2438,6 +2498,47 @@ function handleRequest(req, res) {
         if (!upstreamRes.ok && upstreamRes.status === 429) {
           const poolState = proxy.describe().pool;
           const canFailover = poolState && poolState.active && poolState.enabled > 1;
+          // With WARP on, the same egress refusal is the trigger to rotate the
+          // device instead of walking the pool: one device at a time is the
+          // design, and opencode-hop's delays (1 s success, 5 s failure) apply.
+          if (warp.isEnabled()) {
+            const rotated = await warp.rotate().catch(() => null);
+            if (rotated) {
+              console.warn(
+                `[opencode-free-bridge] WARP rotated after 429; retrying once in ${warp.ROTATE_SUCCESS_DELAY_MS} ms`
+              );
+              await new Promise((r) => setTimeout(r, warp.ROTATE_SUCCESS_DELAY_MS));
+              upstreamRes = await upstreamFetch(upstreamUrl, {
+                method: "POST",
+                headers: upstreamHeaders,
+                body: JSON.stringify(upstreamBody),
+                signal: abortController.signal,
+              });
+              consumedErrorText = null;
+              // Rotation produced a working egress; skip the pool walk below.
+              if (!upstreamRes.ok && upstreamRes.status !== 429) {
+                // fall through to the generic !ok handling below
+              } else if (!upstreamRes.ok) {
+                recordEgressFailure(egressState, {
+                  reason: "allowance 429 after rotation",
+                  cooldownMs: retryAfterMs(upstreamRes),
+                });
+              }
+            } else {
+              console.warn(
+                `[opencode-free-bridge] WARP rotation failed after 429; retrying once in ${warp.ROTATE_FAILURE_DELAY_MS} ms`
+              );
+              await new Promise((r) => setTimeout(r, warp.ROTATE_FAILURE_DELAY_MS));
+              upstreamRes = await upstreamFetch(upstreamUrl, {
+                method: "POST",
+                headers: upstreamHeaders,
+                body: JSON.stringify(upstreamBody),
+                signal: abortController.signal,
+              });
+              consumedErrorText = null;
+            }
+            // WARP path never walks the pool: one device, one retry.
+          } else {
           recordEgressFailure(egressState, {
             reason: "allowance 429",
             cooldownMs: retryAfterMs(upstreamRes) ?? (poolState ? poolState.cooldownMs * 4 : null),
@@ -2508,6 +2609,7 @@ function handleRequest(req, res) {
                 `[opencode-free-bridge] All ${tried.size} pooled egress(es) refused this request; exhausted the pool, returning 429`
               );
             }
+          }
           }
         }
 
@@ -3458,6 +3560,23 @@ if (require.main === module) {
   // highest-priority egress (the renewable phone IP) returns to the top of the
   // pool as soon as it answers again, instead of only after its cooldown.
   setInterval(() => proxy.recoveryProbeTick().catch(() => {}), 60_000).unref();
+  // WARP persists its own toggle; restore it before serving, then arm the
+  // idle reap so an unused tunnel is not left holding a wireproxy process.
+  warp.restoreRuntime();
+  if (warp.isEnabled()) {
+    warp
+      .setEnabled(true)
+      .then((r) => {
+        if (!r.ok) console.warn(`[opencode-free-bridge] WARP restore failed: ${r.error}`);
+        else console.log(`[opencode-free-bridge] WARP tunnel up on ${warp.egressUrl()}`);
+      })
+      .catch(() => {});
+  }
+  warp.armIdleKill();
+  const exitCleanup = () => warp.shutdown();
+  process.on("exit", exitCleanup);
+  process.on("SIGINT", exitCleanup);
+  process.on("SIGTERM", exitCleanup);
 }
 
 module.exports = {

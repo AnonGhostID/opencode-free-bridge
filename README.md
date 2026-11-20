@@ -27,7 +27,12 @@ It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible
 
 Bun is required to talk to the live OpenCode gateway. Node.js 18+ can run the offline unit test suite, but upstream rejects Node.js requests with `403 FreeTierError` because Node's OpenSSL TLS `ClientHello` differs from the compiled OpenCode CLI (which is built on Bun/BoringSSL). The installer installs Bun for you when it is missing.
 
-Supported: Linux (systemd) and macOS (launchd). Windows is not supported; use WSL if you need it there.
+Supported: Linux (systemd) and macOS (launchd). On Windows, run it under WSL2
+or Docker Desktop. The core bridge (server, panel, proxy, pool) is plain
+JavaScript and runs wherever Bun runs; the WARP helper is downloaded for
+Windows too, but `install.sh` does not set up a native Windows service, and
+Bun's TLS fingerprint on Windows is not part of the recorded baseline, so gate
+parity there is untested.
 
 Measured against a raw TCP listener and the live gateway from the same IP within one minute, using identical headers and payload:
 
@@ -524,6 +529,40 @@ identity sync, and the self-updater.
 - **Container:** the compose file mounts the `bridge-state` volume at
   `/data/state` (`OPENCODE_BRIDGE_STATE_DIR`) so the setting survives a
   recreate. Plain `docker run` needs that env var and volume too.
+
+### WARP egress
+
+`bun server.js` can also carry every upstream request through a Cloudflare
+WARP tunnel, so upstream sees a WARP egress instead of this machine's address.
+The switch lives in the panel section "WARP egress" and takes effect on the
+next request without a restart; off (the default) leaves everything else as it
+was. While it is on, the pool and the single proxy are bypassed, and a quota
+refusal rotates the device instead of walking the pool.
+
+How it works, one process, no extra service:
+
+- A device is registered with Cloudflare once and cached at
+  `<state dir>/warp/warp-device.json` (mode `0600`); `warp/warp-state.json`
+  keeps the switch position across restarts, `warp/warp-burned.json` the
+  networks that already refused (24 h TTL, 500 entries), `warp/warp.log` the
+  rotation log.
+- The `wireproxy` helper (`pufferffish/wireproxy` v1.1.3) is downloaded once,
+  verified against `checksums.txt`, unpacked into `warp/`, and run as a child
+  process bound to a loopback HTTP port; Bun tunnels HTTPS through it via
+  `CONNECT`, so the recorded TLS fingerprint is unchanged.
+- A `429 FreeUsageLimitError` triggers up to 4 WARP attempts (key rotation on
+  attempt 3, device replacement on attempt 4) and one retry, 1 s after a
+  successful rotation and 5 s after a failed one. Cloudflare's registration
+  rate limit parks registration for 60 s.
+
+The API mirrors the panel: `GET /api/warp` reads the state, `POST /api/warp`
+with `{"enabled": true|false}` switches it, and `/health` carries the current
+`warp` object plus `egress.mode: "warp"`. Setting `UPSTREAM_PROXY_URL` locks
+the operator egress and refusing WARP overrides it.
+
+The tunnel carries only opencode.ai traffic. WARP registration and rotation
+automate a free Cloudflare consumer service; that is a policy risk the
+operator accepts.
 
 ### Egress pool
 
