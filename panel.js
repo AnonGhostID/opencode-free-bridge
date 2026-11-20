@@ -117,6 +117,21 @@ button:disabled { opacity: 0.55; cursor: default; }
 .report .ok { color: var(--ok); font-weight: 600; }
 .report .bad { color: var(--bad); font-weight: 600; }
 .report .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+/* Terminal-style box for the WARP progress feed: dark surface, mono glyphs,
+   one line per event, keeps history after connect. */
+.warp-console {
+  margin-top: 20px; padding: 12px 14px;
+  background: #17150f; color: #e6dfc8;
+  border: 1px solid var(--rule); border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem; line-height: 1.5;
+  min-height: 9.5em; max-height: 16em; overflow-y: auto;
+}
+.warp-console .row { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.warp-console .t { color: #8f8871; margin-right: 8px; }
+.warp-console .ok { color: #7bc48a; }
+.warp-console .warn { color: #e39a63; }
+.warp-console .bad { color: #f08c82; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; font-size: 0.9375rem; }
 dt { color: var(--muted); }
 dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
@@ -392,14 +407,37 @@ function renderWarp(state) {
   warpOff.disabled = !on;
 }
 
-const warpLines = [];
+const warpConsole = $("warp-console");
+const MAX_CONSOLE_ROWS = 200;
 let warpStream = null;
 
+function classForLine(text) {
+  if (/connected|tunnel up|helper ready|clean|warp enabled/i.test(text)) return "ok";
+  if (/dirty|cooldown|rate limited|already used|not available|would not start|did not come up|no address|no fresh/i.test(text)) return "bad";
+  if (/fetching|connecting|generated|device/i.test(text)) return "warn";
+  return "";
+}
+
 function pushWarpLine(text) {
-  warpLines.push(text);
-  if (warpLines.length > 6) warpLines.shift();
-  const nodes = warpLines.map((l) => line(l, l.startsWith("connected") ? "ok" : ""));
-  showWarpReport(nodes.length ? nodes : [line("…", "")]);
+  const at = new Date().toLocaleTimeString();
+  const row = document.createElement("p");
+  row.className = "row";
+  const stamp = document.createElement("span");
+  stamp.className = "t";
+  stamp.textContent = "[" + at + "]";
+  const body = document.createElement("span");
+  const cls = classForLine(text);
+  if (cls) body.className = cls;
+  body.textContent = " " + text;
+  row.append(stamp, body);
+  warpConsole.append(row);
+  while (warpConsole.childElementCount > MAX_CONSOLE_ROWS) warpConsole.firstElementChild.remove();
+  warpConsole.scrollTop = warpConsole.scrollHeight;
+}
+
+// Seed the box with the current state so it is never an empty box.
+function seedConsole(text) {
+  if (warpConsole.childElementCount === 0) pushWarpLine(text);
 }
 
 function openWarpStream() {
@@ -425,7 +463,13 @@ function closeWarpStream() {
 
 async function loadWarp() {
   try {
-    renderWarp(await readJson(await fetch("/api/warp")));
+    const state = await readJson(await fetch("/api/warp"));
+    renderWarp(state);
+    seedConsole(
+      state.enabled
+        ? "warp aktif: " + (state.tunnel && state.tunnel.exitIp ? state.tunnel.exitIp : "mengambil exit ip…")
+        : "warp mati. tekan Nyalakan WARP untuk memulai."
+    );
   } catch (err) {
     showWarpReport([line("Gagal memuat status WARP: " + err.message, "bad")]);
   }
@@ -434,7 +478,6 @@ async function loadWarp() {
 warpOn.addEventListener("click", async () => {
   warpOn.disabled = true;
   warpOff.disabled = true;
-  warpLines.length = 0;
   openWarpStream();
   try {
     const state = await send("/api/warp", { enabled: true });
@@ -612,6 +655,7 @@ function renderPanel(description, { version = "", port = "" } = {}) {
       <button type="button" class="primary" id="warp-on">Nyalakan WARP</button>
       <button type="button" id="warp-off">Matikan WARP</button>
     </div>
+    <div class="warp-console" id="warp-console" role="log" aria-live="polite"></div>
     <div class="report" id="warp-report" role="status" aria-live="polite" hidden></div>
   </section>
 
