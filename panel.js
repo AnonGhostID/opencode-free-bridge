@@ -392,6 +392,37 @@ function renderWarp(state) {
   warpOff.disabled = !on;
 }
 
+const warpLines = [];
+let warpStream = null;
+
+function pushWarpLine(text) {
+  warpLines.push(text);
+  if (warpLines.length > 6) warpLines.shift();
+  const nodes = warpLines.map((l) => line(l, l.startsWith("connected") ? "ok" : ""));
+  showWarpReport(nodes.length ? nodes : [line("…", "")]);
+}
+
+function openWarpStream() {
+  if (warpStream) return;
+  warpStream = new EventSource("/api/warp/progress");
+  warpStream.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      pushWarpLine(data.message);
+      if (/warp enabled|connected/.test(data.message)) {
+        loadWarp();
+        closeWarpStream();
+      }
+    } catch {}
+  };
+  warpStream.onerror = () => closeWarpStream();
+}
+
+function closeWarpStream() {
+  if (warpStream) warpStream.close();
+  warpStream = null;
+}
+
 async function loadWarp() {
   try {
     renderWarp(await readJson(await fetch("/api/warp")));
@@ -403,6 +434,8 @@ async function loadWarp() {
 warpOn.addEventListener("click", async () => {
   warpOn.disabled = true;
   warpOff.disabled = true;
+  warpLines.length = 0;
+  openWarpStream();
   try {
     const state = await send("/api/warp", { enabled: true });
     renderWarp(state);
@@ -416,6 +449,7 @@ warpOn.addEventListener("click", async () => {
 warpOff.addEventListener("click", async () => {
   warpOn.disabled = true;
   warpOff.disabled = true;
+  closeWarpStream();
   try {
     const state = await send("/api/warp", { enabled: false });
     renderWarp(state);

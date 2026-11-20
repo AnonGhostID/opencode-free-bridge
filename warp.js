@@ -179,7 +179,7 @@ async function registerDevice() {
   const device = describeConfig(body, keyPair);
   device.endpointIps = await resolveEndpointIps(body, device.endpointHost);
   writeDevice(device);
-  appendLog(`registered with Cloudflare: ${device.id} -> ${device.address6 ?? device.address4}`);
+  emitProgress(`registered with Cloudflare: ${device.id} -> ${device.address6 ?? device.address4}`);
   return device;
 }
 
@@ -254,12 +254,11 @@ async function ensureHelper({ now = Date.now } = {}) {
 async function downloadHelper() {
   const archiveName = helperArchiveName();
   if (!archiveName) {
-    appendLog(`helper not available: wireproxy has no build for ${process.platform}/${process.arch}`);
+    emitProgress(`helper not available: wireproxy has no build for ${process.platform}/${process.arch}`);
     return false;
   }
   try {
     fs.mkdirSync(warpHome(), { recursive: true });
-    appendLog(`fetching ${archiveName}`);
     const checksumText = await fetch(helperChecksumUrl(), {
       signal: AbortSignal.timeout(CHECKSUM_TIMEOUT_MS),
     }).then((res) => res.text());
@@ -272,6 +271,9 @@ async function downloadHelper() {
       signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const sizeHead = res.headers.get("content-length");
+    const archiveLength = sizeHead ? Number(sizeHead) : null;
+    emitProgress(`fetching ${archiveName}${archiveLength ? ` (${(archiveLength / 1024 / 1024).toFixed(1)} MB)` : ""}`);
     const archive = Buffer.from(await res.arrayBuffer());
     if (expected) {
       const actual = crypto.createHash("sha256").update(archive).digest("hex");
@@ -292,12 +294,13 @@ async function downloadHelper() {
     if (!fs.existsSync(helperPath())) throw new Error("unpacked but missing");
     // chmod is a no-op on Windows filesystems that ignore the POSIX bits.
     try { fs.chmodSync(helperPath(), 0o755); } catch {}
+    emitProgress(`extracted ${helperBinaryName()}`);
     helperVerified = true;
     helperVerifiedAt = Date.now();
-    appendLog("helper ready");
+    emitProgress(`helper ready (${helperBinaryName()})`);
     return true;
   } catch (err) {
-    appendLog(`helper not available: ${err.message}`);
+    emitProgress(`helper not available: ${err.message}`);
     return false;
   }
 }
@@ -397,13 +400,14 @@ async function startTunnel(device) {
   if (!(await ensureHelper())) return false;
   const bindPort = await findFreePort();
   if (!bindPort) {
-    appendLog("no free local port");
+    emitProgress("no free local port");
     return false;
   }
   const endpoint = pickEndpoint(device);
   const configPath = path.join(warpHome(), `warp-proxy-${bindPort}.conf`);
   fs.mkdirSync(warpHome(), { recursive: true });
   fs.writeFileSync(configPath, buildHelperConfig(device, bindPort, endpoint));
+  emitProgress(`generated config for ${device.id} (tunnel bind 127.0.0.1:${bindPort})`);
 
   const logFd = fs.openSync(logFile(), "a");
   const child = spawn(helperPath(), [
@@ -415,11 +419,12 @@ async function startTunnel(device) {
   tunnelProc = child;
   tunnelPort = bindPort;
   tunnelEndpoint = endpoint;
+  emitProgress(`connecting to ${endpoint}`);
 
-  child.on("error", (err) => appendLog(`tunnel would not start: ${err.message}`));
+  child.on("error", (err) => emitProgress(`tunnel would not start: ${err.message}`));
   child.once("exit", (code, signal) => {
     if (tunnelProc !== child) return;
-    appendLog(`tunnel exited on its own (${signal ?? code})`);
+    emitProgress(`tunnel exited on its own (${signal ?? code})`);
     tunnelProc = null;
     tunnelPort = 0;
     tunnelEndpoint = null;
@@ -430,12 +435,13 @@ async function startTunnel(device) {
     if (child.exitCode !== null) break;
     if (await portReachable(bindPort)) {
       lastWorkingEndpoint = endpoint;
+      emitProgress("tunnel up");
       return true;
     }
     await new Promise((r) => setTimeout(r, PROBE_RETRY_MS));
   }
   await stopTunnel();
-  appendLog(`tunnel did not come up on ${endpoint}`);
+  emitProgress(`tunnel did not come up on ${endpoint}`);
   return false;
 }
 
@@ -549,7 +555,7 @@ async function ensureDevice() {
     deviceCache = await registerDevice();
     return deviceCache;
   } catch (err) {
-    appendLog(`could not register: ${err.message}`);
+    emitProgress(`could not register: ${err.message}`);
     deviceCache = null;
     return null;
   }
@@ -605,31 +611,31 @@ async function rotateNow() {
         deviceCache = replacement;
         device = replacement;
       } catch (err) {
-        appendLog(`could not replace the device: ${err.message}`);
+        emitProgress(`could not replace the device: ${err.message}`);
       }
     }
     if (!(await startTunnel(device))) {
-      appendLog(`tunnel would not start (attempt ${attempt}/${WARP_ATTEMPTS})`);
+      emitProgress(`tunnel would not start (attempt ${attempt}/${WARP_ATTEMPTS})`);
       continue;
     }
     const after = await tunnelExitIp(currentProxyUrl(), ROTATION_PROBE_TIMEOUT_MS);
     if (!after) {
-      appendLog(`no address through the tunnel (attempt ${attempt}/${WARP_ATTEMPTS})`);
+      emitProgress(`no address through the tunnel (attempt ${attempt}/${WARP_ATTEMPTS})`);
       continue;
     }
     const afterNetworkId = networkIdOf(after);
     if (after === before || (afterNetworkId && afterNetworkId === beforeNetworkId) || loadBurned().has(afterNetworkId)) {
-      appendLog(`the tunnel came up on an already used network (${after})`);
+      emitProgress(`the tunnel came up on an already used network (${after})`);
       continue;
     }
     markBurned(afterNetworkId);
     success = true;
-    appendLog(`rotated: ${before ?? "unknown"} -> ${after}${afterNetworkId && afterNetworkId !== after ? ` [${afterNetworkId}]` : ""}`);
+    emitProgress(`rotated: ${before ?? "unknown"} -> ${after}${afterNetworkId && afterNetworkId !== after ? ` [${afterNetworkId}]` : ""}`);
     break;
   }
 
   if (!success) {
-    appendLog("no fresh network is available");
+    emitProgress("no fresh network is available");
     return null;
   }
   return currentProxyUrl();
@@ -684,11 +690,12 @@ async function setEnabled(next) {
     enabled = false;
     await stopTunnel();
     persistRuntime();
-    appendLog("warp disabled");
+    emitProgress("warp disabled");
     return { ok: true, enabled: false };
   }
   const device = await ensureDevice();
   if (!device) return { ok: false, enabled: false, error: "no WARP device could be registered" };
+  emitProgress(`device ${device.id} ready (${device.address6 ?? device.address4})`);
   if (!(await ensureHelper())) return { ok: false, enabled: false, error: "wireproxy helper unavailable" };
   if (!(await startTunnel(device))) return { ok: false, enabled: false, error: "tunnel did not start" };
   // Sample the exit IP once so /health and the panel can show it instead of
@@ -696,11 +703,11 @@ async function setEnabled(next) {
   const initialExitIp = await tunnelExitIp(egressUrl(), ROTATION_PROBE_TIMEOUT_MS);
   if (initialExitIp) {
     lastExitIp = initialExitIp;
-    appendLog(`exit ip: ${initialExitIp}`);
+    emitProgress(`connected. exit ip: ${initialExitIp}`);
   }
   enabled = true;
   persistRuntime();
-  appendLog("warp enabled");
+  emitProgress("warp enabled");
   return { ok: true, enabled: true };
 }
 
@@ -774,6 +781,25 @@ function appendLog(line) {
   } catch {}
 }
 
+// ------------------------------------------------------------ progress feed ---
+
+// Toggle-on is a multi-second sequence (device, helper download, config,
+// tunnel, probe). Callers subscribe before setEnabled and receive the same
+// lines the log gets, so a UI can show each step as it happens.
+const progressSubscribers = new Set();
+
+function emitProgress(line) {
+  appendLog(line);
+  for (const subscriber of progressSubscribers) {
+    try { subscriber({ at: Date.now(), message: line }); } catch {}
+  }
+}
+
+function onProgress(callback) {
+  progressSubscribers.add(callback);
+  return () => progressSubscribers.delete(callback);
+}
+
 function rotateLog() {
   try {
     fs.copyFileSync(logFile(), logFile() + ".1");
@@ -817,6 +843,7 @@ module.exports = {
   CLIENT_VERSION,
   isEnabled,
   setEnabled,
+  onProgress,
   egressUrl,
   rotate,
   describe,

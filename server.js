@@ -2088,6 +2088,34 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // Live progress for the WARP toggle: text/event-stream of the steps the
+  // enable path emits (device, download, extract, config, connect, exit ip).
+  // One subscriber per connection; the connection closes on toggle finish.
+  if (pathname === "/api/warp/progress") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(denied.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: denied.error }));
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store",
+      Connection: "keep-alive",
+    });
+    res.write(": progress stream open\n\n");
+    let unsubscribe = null;
+    const close = () => {
+      if (unsubscribe) unsubscribe();
+      unsubscribe = null;
+    };
+    unsubscribe = warp.onProgress((event) => {
+      try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch { close(); }
+    });
+    req.on("close", close);
+    return;
+  }
+
   // Health check
   if (pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
