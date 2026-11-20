@@ -118,12 +118,12 @@ describe("describe", () => {
 });
 
 describe("runtime persistence", () => {
-  it("persists and restores the toggle", () => {
+  it("persists the toggle, and boot reset always starts off", () => {
     warp.__setEnabledForTest(true);
     warp.persistRuntime();
-    warp.__setEnabledForTest(false);
-    warp.restoreRuntime();
-    assert.equal(warp.isEnabled(), true);
+    warp.resetRuntime();
+    assert.equal(warp.isEnabled(), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(warp.warpHome(), "warp-state.json"), "utf8")), { enabled: false });
   });
 });
 

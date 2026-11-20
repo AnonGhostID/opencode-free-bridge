@@ -543,9 +543,11 @@ How it works, one process, no extra service:
 
 - A device is registered with Cloudflare once and cached at
   `<state dir>/warp/warp-device.json` (mode `0600`); `warp/warp-state.json`
-  keeps the switch position across restarts, `warp/warp-burned.json` the
-  networks that already refused (24 h TTL, 500 entries), `warp/warp.log` the
-  rotation log.
+  reflects the switch position but never re-activates at boot: `bun
+  server.js` always starts with WARP off, and the device, burned networks
+  and helper survive restarts. `warp/warp-burned.json` holds the networks
+  that already refused (24 h TTL, 500 entries), `warp/warp.log` the rotation
+  log.
 - The `wireproxy` helper (`pufferffish/wireproxy` v1.1.3) is downloaded once,
   verified against `checksums.txt`, unpacked into `warp/`, and run as a child
   process bound to a loopback HTTP port; Bun tunnels HTTPS through it via

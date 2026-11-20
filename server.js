@@ -3588,18 +3588,11 @@ if (require.main === module) {
   // highest-priority egress (the renewable phone IP) returns to the top of the
   // pool as soon as it answers again, instead of only after its cooldown.
   setInterval(() => proxy.recoveryProbeTick().catch(() => {}), 60_000).unref();
-  // WARP persists its own toggle; restore it before serving, then arm the
-  // idle reap so an unused tunnel is not left holding a wireproxy process.
-  warp.restoreRuntime();
-  if (warp.isEnabled()) {
-    warp
-      .setEnabled(true)
-      .then((r) => {
-        if (!r.ok) console.warn(`[opencode-free-bridge] WARP restore failed: ${r.error}`);
-        else console.log(`[opencode-free-bridge] WARP tunnel up on ${warp.egressUrl()}`);
-      })
-      .catch(() => {});
-  }
+  // WARP never auto-activates at boot: the bridge starts with the last
+  // persisted state cleared so the toggle is off until the operator turns it
+  // on. The idle reap still runs so a manually started tunnel is reaped when
+  // it goes unused, and shutdown still cleans up on exit.
+  warp.resetRuntime();
   warp.armIdleKill();
   // Registering a SIGINT/SIGTERM handler disables Bun's default kill, so the
   // handler has to terminate the process itself or a listening server hangs

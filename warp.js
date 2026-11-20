@@ -810,15 +810,15 @@ function persistRuntime() {
   } catch {}
 }
 
-function restoreRuntime() {
-  // Reset first: a persisted "enabled" from the previous process must not
-  // make the boot's setEnabled(true) hit the no-op branch and skip tunnel
-  // startup ("WARP tunnel up on null").
+/**
+ * Boot path: the toggle never auto-activates. Clear both the in-memory flag
+ * and the persisted file, so a restart is a fresh off, not a resume of the
+ * last session's on.
+ */
+function resetRuntime() {
   enabled = false;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(warpHome(), "warp-state.json"), "utf8"));
-    enabled = Boolean(parsed?.enabled);
-  } catch {}
+  try { fs.rmSync(path.join(warpHome(), "warp-state.json"), { force: true }); } catch {}
+  persistRuntime();
 }
 
 function appendLog(line) {
@@ -925,7 +925,7 @@ module.exports = {
   probeCurrentAddress,
   probeIpHealth,
   armIdleKill,
-  restoreRuntime,
+  resetRuntime,
   persistRuntime,
   appendLog,
   metricsPortForTest,
