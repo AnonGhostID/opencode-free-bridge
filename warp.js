@@ -691,6 +691,13 @@ async function setEnabled(next) {
   if (!device) return { ok: false, enabled: false, error: "no WARP device could be registered" };
   if (!(await ensureHelper())) return { ok: false, enabled: false, error: "wireproxy helper unavailable" };
   if (!(await startTunnel(device))) return { ok: false, enabled: false, error: "tunnel did not start" };
+  // Sample the exit IP once so /health and the panel can show it instead of
+  // null until the first rotation; a failed probe stays null on purpose.
+  const initialExitIp = await tunnelExitIp(egressUrl(), ROTATION_PROBE_TIMEOUT_MS);
+  if (initialExitIp) {
+    lastExitIp = initialExitIp;
+    appendLog(`exit ip: ${initialExitIp}`);
+  }
   enabled = true;
   persistRuntime();
   appendLog("warp enabled");
