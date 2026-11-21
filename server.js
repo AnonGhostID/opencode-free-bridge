@@ -28,6 +28,7 @@ const { effectiveMaxTokens } = require("./token-budget");
 const { handleAnthropicMessages, handleCountTokens } = require("./anthropic");
 const panel = require("./panel");
 const warp = require("./warp");
+const telemetry = require("./telemetry");
 const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
@@ -77,6 +78,7 @@ const UPDATE_FILES = [
   "transport-baseline.json",
   "tunnel-doctor.sh",
   "panel.js",
+  "telemetry.js",
   "egress-proxy.js",
   "warp.js",
   "anthropic.js",
@@ -1746,7 +1748,7 @@ async function handleRequest(req, res) {
       res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
       return res.end(req.method === "HEAD" ? undefined : denied);
     }
-    const html = panel.renderPanel({ mode: "direct", pool: { active: false, entries: [] } }, { version: VERSION, port: PORT });
+    const html = panel.renderPanel({ mode: warp.isEnabled() ? "warp" : "direct", pool: { active: false, entries: [] } }, { version: VERSION, port: PORT });
     res.writeHead(200, {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
@@ -1759,8 +1761,8 @@ async function handleRequest(req, res) {
   if (pathname === "/api/warp") {
     const denied = adminRequestError(req);
     if (denied) {
-      res.writeHead(denied.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ error: denied.error }));
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: denied }));
       return;
     }
     if (req.method === "GET" || req.method === "HEAD") {
@@ -1809,8 +1811,8 @@ async function handleRequest(req, res) {
   if (pathname === "/api/warp/progress") {
     const denied = adminRequestError(req);
     if (denied) {
-      res.writeHead(denied.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ error: denied.error }));
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: denied }));
       return;
     }
     res.writeHead(200, {
@@ -1829,6 +1831,117 @@ async function handleRequest(req, res) {
     });
     req.on("close", close);
     return;
+  }
+
+  if (pathname === "/api/stats") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method === "GET" || req.method === "HEAD") {
+      const payload = JSON.stringify({
+        ...telemetry.getStats(),
+        discoveredModels: activeModels.length,
+        egressMode: warp.isEnabled() ? "warp" : UPSTREAM_RELAY_URL ? "relay" : "direct",
+      });
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(req.method === "HEAD" ? undefined : payload);
+    }
+    res.writeHead(405, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "Gunakan GET untuk membaca statistik." }));
+  }
+
+  if (pathname === "/api/stats/reset") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Gunakan POST untuk mereset statistik." }));
+    }
+    const type = String(req.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (type !== "application/json") {
+      res.writeHead(415, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: "Content-Type harus application/json." }));
+    }
+    telemetry.resetStats();
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify({ ok: true, ...telemetry.getStats() }));
+  }
+
+  if (pathname === "/api/logs") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method === "GET" || req.method === "HEAD") {
+      const params = new URLSearchParams(qIdx === -1 ? "" : rawUrl.slice(qIdx + 1));
+      const payload = JSON.stringify(
+        telemetry.getLogs({
+          limit: params.get("limit") || 200,
+          level: params.get("level") || "all",
+          kind: params.get("kind") || "all",
+          model: params.get("model") || "",
+          q: params.get("q") || "",
+        })
+      );
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(req.method === "HEAD" ? undefined : payload);
+    }
+    res.writeHead(405, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "Gunakan GET untuk membaca log." }));
+  }
+
+  if (pathname === "/api/logs/stream") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-store",
+      Connection: "keep-alive",
+    });
+    res.write(": log stream open\n\n");
+    let unsubscribe = null;
+    const close = () => {
+      if (unsubscribe) unsubscribe();
+      unsubscribe = null;
+    };
+    unsubscribe = telemetry.subscribe((entry) => {
+      try {
+        res.write(`data: ${JSON.stringify(entry)}\n\n`);
+      } catch {
+        close();
+      }
+    });
+    req.on("close", close);
+    return;
+  }
+
+  if (pathname === "/api/logs/clear") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Gunakan POST untuk menghapus log." }));
+    }
+    const type = String(req.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (type !== "application/json") {
+      res.writeHead(415, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: "Content-Type harus application/json." }));
+    }
+    telemetry.clearLogs();
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify({ ok: true }));
   }
 
   // Health check
@@ -1912,6 +2025,7 @@ async function handleRequest(req, res) {
 
   // Model list (triggers async re-discovery when the hourly TTL expired)
   if (req.method === "GET" && (pathname === "/v1/models" || pathname === "/models")) {
+    telemetry.recordEndpointHit(pathname);
     if (activeModels.length === 0) {
       discoverModels()
         .catch(() => {})
@@ -1958,6 +2072,46 @@ async function handleRequest(req, res) {
   }
   // Chat completions
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
+    const reqStartMs = Date.now();
+    telemetry.beginRequest();
+    const reqTelemetry = {
+      model: null,
+      stream: false,
+      protocol: "chat",
+      egress: warp.isEnabled() ? "warp" : UPSTREAM_RELAY_URL ? "relay" : "direct",
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      error: null,
+      logId: null,
+      recorded: false,
+    };
+    const recordChatTelemetry = (statusOverride, errOverride) => {
+      if (reqTelemetry.recorded) return;
+      reqTelemetry.recorded = true;
+      telemetry.endRequest();
+      telemetry.recordRequest({
+        method: req.method,
+        path: pathname,
+        model: reqTelemetry.model || "(invalid)",
+        stream: reqTelemetry.stream,
+        status: statusOverride !== undefined ? statusOverride : res.statusCode || 0,
+        latencyMs: Date.now() - reqStartMs,
+        promptTokens: reqTelemetry.promptTokens,
+        completionTokens: reqTelemetry.completionTokens,
+        totalTokens: reqTelemetry.totalTokens,
+        egress: reqTelemetry.egress,
+        protocol: reqTelemetry.protocol,
+        error: errOverride || reqTelemetry.error,
+        logId: reqTelemetry.logId,
+      });
+    };
+    res.once("finish", () => recordChatTelemetry(res.statusCode));
+    res.once("close", () => {
+      if (!reqTelemetry.recorded) {
+        recordChatTelemetry(res.writableEnded ? res.statusCode : 499, res.writableEnded ? null : "Client disconnected");
+      }
+    });
     (async () => {
       let bodyText;
       try {
@@ -2010,6 +2164,7 @@ async function handleRequest(req, res) {
       }
 
       const targetModel = normalizeModel(body.model);
+      if (targetModel) reqTelemetry.model = targetModel;
       if (!targetModel) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(
@@ -2061,6 +2216,7 @@ async function handleRequest(req, res) {
       }
 
       const clientStream = Boolean(body.stream);
+      reqTelemetry.stream = clientStream;
 
       // Lazy identity check: no timer runs in the background. The first request
       // after the TTL kicks off a refresh in the background and proceeds with
@@ -2069,6 +2225,7 @@ async function handleRequest(req, res) {
       syncUserAgent();
 
       let useResponses = isResponsesModel(targetModel);
+      reqTelemetry.protocol = useResponses ? "responses" : "chat";
       const sessionId = getPersistentSessionId(req, body);
       let retryHeaders = null;
       const upstreamHeaders = buildUpstreamHeaders(req, sessionId);
@@ -2126,6 +2283,7 @@ async function handleRequest(req, res) {
           ) {
             useResponses = !useResponses;
             markProtocolSupport(targetModel, useResponses);
+            reqTelemetry.protocol = useResponses ? "responses" : "chat";
             ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses));
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             upstreamRes = await upstreamFetch(upstreamUrl, {
@@ -2536,6 +2694,8 @@ async function handleRequest(req, res) {
               }): ${retryMsg} — ${verdictText}` +
                 (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "")
             );
+            reqTelemetry.error = retryMsg;
+            reqTelemetry.logId = upstreamLogId || null;
             const outStatus = resolveIpThrottleStatus(upstreamRes.status, retryFreeTierMsg && !capacity);
             res.writeHead(
               outStatus,
@@ -2584,6 +2744,7 @@ async function handleRequest(req, res) {
             res.write(payload);
           };
           const emitStreamError = (errMessage, errType) => {
+            reqTelemetry.error = errMessage;
             console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${errMessage}`);
             reader.cancel().catch(() => {});
             if (!sseHeadersSent) {
@@ -2726,6 +2887,11 @@ async function handleRequest(req, res) {
                       total_tokens: ev.response.usage.total_tokens || 0,
                     };
                   }
+                  if (streamUsage) {
+                    reqTelemetry.promptTokens = streamUsage.prompt_tokens || 0;
+                    reqTelemetry.completionTokens = streamUsage.completion_tokens || 0;
+                    reqTelemetry.totalTokens = streamUsage.total_tokens || 0;
+                  }
                 }
               } catch {}
             };
@@ -2785,6 +2951,16 @@ async function handleRequest(req, res) {
                   return;
                 }
               } catch {}
+              if (raw.includes('"usage"')) {
+                try {
+                  const uObj = JSON.parse(raw)?.usage;
+                  if (uObj && typeof uObj === "object") {
+                    reqTelemetry.promptTokens = uObj.prompt_tokens || uObj.input_tokens || 0;
+                    reqTelemetry.completionTokens = uObj.completion_tokens || uObj.output_tokens || 0;
+                    reqTelemetry.totalTokens = uObj.total_tokens || (reqTelemetry.promptTokens + reqTelemetry.completionTokens);
+                  }
+                } catch {}
+              }
               // Zero-parse fast path: when no client tools are aliased and the chunk
               // carries no `"reasoning":` field to normalize, forward raw SSE bytes directly.
               if (!hasAliases && !raw.includes('"reasoning"')) {
@@ -2945,6 +3121,7 @@ async function handleRequest(req, res) {
         await consumeSseLines(reader, decoder, handleNonStreamLine);
 
         if (streamError) {
+          reqTelemetry.error = streamError;
           console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamError}`);
           res.writeHead(502, { "Content-Type": "application/json" });
           return res.end(
@@ -2968,6 +3145,9 @@ async function handleRequest(req, res) {
           finishReason = "tool_calls";
         }
 
+        reqTelemetry.promptTokens = usage.prompt_tokens || 0;
+        reqTelemetry.completionTokens = usage.completion_tokens || 0;
+        reqTelemetry.totalTokens = usage.total_tokens || 0;
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({
@@ -2993,6 +3173,7 @@ async function handleRequest(req, res) {
           return;
         }
         if (timedOut) {
+          reqTelemetry.error = `Upstream request timed out after ${UPSTREAM_TIMEOUT_MS}ms`;
           if (!res.headersSent) {
             res.writeHead(504, { "Content-Type": "application/json" });
             return res.end(
@@ -3007,6 +3188,7 @@ async function handleRequest(req, res) {
           }
           return res.end();
         }
+        reqTelemetry.error = err?.message || "Internal server error";
         console.error("[opencode-free-bridge] exception:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -3109,6 +3291,8 @@ if (require.main === module) {
     refuseNodeRuntime();
     process.exit(1);
   }
+  telemetry.initPersistence();
+  telemetry.installConsoleHook();
   server.listen(PORT, HOST, () => {
     console.log(`[opencode-free-bridge] v${VERSION} listening on http://${HOST}:${PORT}`);
     if (!ON_BUN) {
@@ -3137,6 +3321,7 @@ if (require.main === module) {
   // through Ctrl+C. warp.shutdown is sync (it only kills the helper child and
   // clears timers), so nothing here can delay the exit.
   const exitCleanup = (signal) => {
+    telemetry.flushSync();
     warp.shutdown();
     process.exit(0);
   };
@@ -3218,4 +3403,5 @@ module.exports = {
   __getCliVersionState: () => ({ lastCliVersionCheckTime }),
   __setLastUpdateCheck: (v) => { lastUpdateCheck = v; },
   __adminRequestError: adminRequestError,
+  telemetry,
 };

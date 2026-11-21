@@ -392,8 +392,16 @@ async function stopTunnel() {
     tunnelPort = 0;
     tunnelEndpoint = null;
     lastWorkingEndpoint = null;
+    currentProxyUrlValue = null;
+    tunnelProxyUrl = null;
+    currentProxyUrlValue = null;
+    tunnelProxyUrl = null;
     try { proc.removeAllListeners("exit"); } catch {}
     try { proc.kill("SIGTERM"); } catch {}
+  }
+  if (tunnelConfigPath) {
+    try { fs.rmSync(tunnelConfigPath, { force: true }); } catch {}
+    tunnelConfigPath = null;
   }
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
@@ -409,7 +417,8 @@ async function startTunnel(device) {
   const endpoint = pickEndpoint(device);
   const configPath = path.join(warpHome(), `warp-proxy-${bindPort}.conf`);
   fs.mkdirSync(warpHome(), { recursive: true });
-  fs.writeFileSync(configPath, buildHelperConfig(device, bindPort, endpoint));
+  fs.writeFileSync(configPath, buildHelperConfig(device, bindPort, endpoint), { mode: 0o600 });
+  tunnelConfigPath = configPath;
   emitProgress(`generated config for ${device.id} (tunnel bind 127.0.0.1:${bindPort})`);
 
   const logFd = fs.openSync(logFile(), "a");
@@ -422,6 +431,8 @@ async function startTunnel(device) {
   tunnelProc = child;
   tunnelPort = bindPort;
   tunnelEndpoint = endpoint;
+  currentProxyUrlValue = `http://127.0.0.1:${bindPort}`;
+  tunnelProxyUrl = currentProxyUrlValue;
   emitProgress(`connecting to ${endpoint}`);
 
   child.on("error", (err) => emitProgress(`tunnel would not start: ${err.message}`));
@@ -590,22 +601,50 @@ async function probeCurrentAddress() {
  * verdict and reads as unknown (the gate can refuse shapes, not just IPs).
  */
 async function probeIpHealth(proxyUrl) {
+  let ua = "opencode/latest/2.0.0/cli";
+  let sessionId = `ses_${crypto.randomBytes(12).toString("hex")}`;
+  try {
+    const idMod = require("./identity");
+    if (typeof idMod.getUserAgent === "function") ua = idMod.getUserAgent() || ua;
+    if (typeof idMod.createSessionId === "function") sessionId = idMod.createSessionId() || sessionId;
+  } catch {}
   const init = {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer public",
+      "User-Agent": ua,
+      "x-opencode-session": sessionId,
+    },
     body: JSON.stringify({
       model: "big-pickle",
       max_tokens: 1,
-      stream: false,
-      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      messages: [
+        { role: "system", content: "<env>\nWorking directory: /tmp\n</env>" },
+        { role: "user", content: "hi" },
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "read",
+            description: "Read a file",
+            parameters: {
+              type: "object",
+              properties: { filePath: { type: "string" } },
+              required: ["filePath"],
+            },
+          },
+        },
+      ],
     }),
     signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
   };
   try {
-    const res = await fetch("https://opencode.ai/inference/v1/chat/completions", {
-      ...init,
-      proxy: proxyUrl,
-    });
+    const fetchOpts = proxyUrl ? { ...init, proxy: proxyUrl } : init;
+    const res = await fetch("https://opencode.ai/inference/v1/chat/completions", fetchOpts);
+    try { await res.body?.cancel?.(); } catch {}
     if (res.status === 429) return { state: "dirty", status: 429 };
     if (res.ok) return { state: "clean", status: res.status };
     return { state: "unknown", status: res.status };
@@ -638,8 +677,8 @@ async function rotate() {
 }
 
 async function rotateNow() {
-  const before = await probeCurrentAddress();
-  if (before && tunnelProxyUrl === null) markBurned(networkIdOf(before));
+  const prevProxy = currentProxyUrl();
+  const before = prevProxy ? (await tunnelExitIp(prevProxy, ROTATION_PROBE_TIMEOUT_MS)) || lastExitIp : lastExitIp;
   const beforeNetworkId = networkIdOf(before);
   if (beforeNetworkId) markBurned(beforeNetworkId);
 
@@ -665,7 +704,8 @@ async function rotateNow() {
       emitProgress(`tunnel would not start (attempt ${attempt}/${WARP_ATTEMPTS})`);
       continue;
     }
-    const after = await tunnelExitIp(currentProxyUrl(), ROTATION_PROBE_TIMEOUT_MS);
+    const nextProxy = currentProxyUrl();
+    const after = nextProxy ? await tunnelExitIp(nextProxy, ROTATION_PROBE_TIMEOUT_MS) : null;
     if (!after) {
       emitProgress(`no address through the tunnel (attempt ${attempt}/${WARP_ATTEMPTS})`);
       continue;
@@ -675,6 +715,7 @@ async function rotateNow() {
       emitProgress(`the tunnel came up on an already used network (${after})`);
       continue;
     }
+    lastExitIp = after;
     markBurned(afterNetworkId);
     success = true;
     emitProgress(`rotated: ${before ?? "unknown"} -> ${after}${afterNetworkId && afterNetworkId !== after ? ` [${afterNetworkId}]` : ""}`);
@@ -703,9 +744,11 @@ let helperVerifiedAt = 0;
 let rotationInFlight = null;
 let currentProxyUrlValue = null;
 let tunnelProxyUrl = null;
+let tunnelConfigPath = null;
 let idleKillTimer = null;
 
 function currentProxyUrl() {
+  if (tunnelProc && tunnelPort) return `http://127.0.0.1:${tunnelPort}`;
   return currentProxyUrlValue;
 }
 
@@ -727,6 +770,41 @@ function isEnabled() {
   return enabled;
 }
 
+/**
+ * Remove all runtime WARP files inside `warpHome()` (device, burned list,
+ * state, temp configs, logs) and reset in-memory caches so WARP starts clean,
+ * while preserving the `wireproxy` / `wireproxy.exe` helper binary.
+ */
+function cleanWarpState() {
+  if (burnedWriteTimer) {
+    clearTimeout(burnedWriteTimer);
+    burnedWriteTimer = null;
+  }
+  deviceCache = null;
+  burnedCache = null;
+  lastExitIp = null;
+  lastExitHealth = null;
+  lastExitHealthStatus = null;
+  lastWorkingEndpoint = null;
+  tunnelConfigPath = null;
+
+  const home = warpHome();
+  if (!fs.existsSync(home)) return;
+  const keep = new Set(["wireproxy", "wireproxy.exe", helperBinaryName()]);
+  const customHelper = helperPath();
+  if (path.dirname(customHelper) === home) {
+    keep.add(path.basename(customHelper));
+  }
+  try {
+    for (const entry of fs.readdirSync(home)) {
+      if (keep.has(entry)) continue;
+      try {
+        fs.rmSync(path.join(home, entry), { recursive: true, force: true });
+      } catch {}
+    }
+  } catch {}
+}
+
 async function setEnabled(next) {
   const want = Boolean(next);
   if (want === enabled) return { ok: true, enabled, reason: "no-op" };
@@ -736,10 +814,15 @@ async function setEnabled(next) {
   if (!want) {
     enabled = false;
     await stopTunnel();
-    persistRuntime();
-    emitProgress("warp disabled");
+    cleanWarpState();
+    for (const subscriber of progressSubscribers) {
+      try { subscriber({ at: Date.now(), message: "warp disabled (state cleaned)" }); } catch {}
+    }
     return { ok: true, enabled: false };
   }
+  await stopTunnel();
+  cleanWarpState();
+  emitProgress("starting fresh WARP session (previous state cleared)");
   const device = await ensureDevice();
   if (!device) return { ok: false, enabled: false, error: "no WARP device could be registered" };
   emitProgress(`device ${device.id} ready (${device.address6 ?? device.address4})`);
@@ -750,7 +833,7 @@ async function setEnabled(next) {
   if (lastExitIp) {
     const directIp = await directExitIp(Date.now() + EXIT_IP_TIMEOUT_MS);
     emitProgress(`connected. exit ip: ${lastExitIp}${directIp ? ` (direct: ${directIp})` : ""}`);
-    const health = await probeIpHealth(egressUrl());
+    const health = await probeIpHealth(currentProxyUrl());
     lastExitHealth = health.state;
     lastExitHealthStatus = health.status;
     emitProgress(
@@ -877,6 +960,13 @@ function shutdown() {
     try { tunnelProc.kill("SIGTERM"); } catch {}
     tunnelProc = null;
   }
+  tunnelPort = 0;
+  currentProxyUrlValue = null;
+  tunnelProxyUrl = null;
+  if (tunnelConfigPath) {
+    try { fs.rmSync(tunnelConfigPath, { force: true }); } catch {}
+    tunnelConfigPath = null;
+  }
 }
 
 function metricsPortForTest(port) {
@@ -913,6 +1003,7 @@ module.exports = {
   setEnabled,
   onProgress,
   egressUrl,
+  currentProxyUrl,
   rotate,
   describe,
   shutdown,
@@ -935,6 +1026,7 @@ module.exports = {
   probeIpHealth,
   armIdleKill,
   resetRuntime,
+  cleanWarpState,
   persistRuntime,
   appendLog,
   metricsPortForTest,
