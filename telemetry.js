@@ -29,7 +29,9 @@ const MAX_LOG_BYTES = Math.max(
 );
 const STATS_FLUSH_DEBOUNCE_MS = 1000;
 
-let startedAt = Date.now();
+// Process uptime is deliberately process-local: a restart must restart it.
+// Persistent totals live in stats.json, but this timestamp never round-trips.
+const startedAt = Date.now();
 let nextLogId = 1;
 let persistEnabled = false;
 let statsDirty = false;
@@ -130,7 +132,6 @@ function writeStatsToDisk() {
     ensureDir();
     const snapshot = {
       version: 1,
-      startedAt,
       totals: {
         requests: totals.requests,
         ok: totals.ok,
@@ -214,9 +215,6 @@ function initPersistence({ enable = true } = {}) {
     if (fs.existsSync(file)) {
       const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
       if (parsed && typeof parsed === "object") {
-        if (Number.isFinite(Number(parsed.startedAt)) && Number(parsed.startedAt) > 0) {
-          startedAt = Number(parsed.startedAt);
-        }
         const t = parsed.totals || {};
         totals.requests = Math.round(toNum(t.requests));
         totals.ok = Math.round(toNum(t.ok));
@@ -650,7 +648,6 @@ function subscribe(fn) {
 }
 
 function resetStats() {
-  startedAt = Date.now();
   totals.requests = 0;
   totals.ok = 0;
   totals.errors = 0;

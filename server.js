@@ -1704,6 +1704,11 @@ function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
 // --- HTTP Server ---
 async function handleRequest(req, res) {
   req.on("error", (err) => {
+    // A client disconnecting mid-request is routine: the panel's two SSE
+    // streams are torn down on every reload, and the panel keeps polling
+    // across server restarts. Those aborts are not faults, so only a real
+    // unexpected error is worth a log line.
+    if (err?.message === "aborted") return;
     console.warn("[opencode-free-bridge] request stream error:", err.message);
   });
   res.on("error", (err) => {

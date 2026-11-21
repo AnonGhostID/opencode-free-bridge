@@ -263,6 +263,56 @@ describe("telemetry disk persistence", () => {
       fs.rmSync(tmpState, { recursive: true, force: true });
     }
   });
+
+  it("resets uptime on restart instead of rehydrating the previous start time", () => {
+    const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-uptime-"));
+    const prevState = process.env.OPENCODE_BRIDGE_STATE_DIR;
+    const prevTel = process.env.OPENCODE_TELEMETRY_DIR;
+    try {
+      process.env.OPENCODE_BRIDGE_STATE_DIR = tmpState;
+      delete process.env.OPENCODE_TELEMETRY_DIR;
+
+      telemetry.setPersistence(false);
+      telemetry.resetStats();
+      telemetry.initPersistence({ enable: true });
+
+      // A previous run left stats behind, including a day-old start time.
+      const oldStartedAt = Date.now() - 86_400_000;
+      fs.mkdirSync(telemetry.telemetryDir(), { recursive: true });
+      fs.writeFileSync(
+        telemetry.statsFile(),
+        JSON.stringify({
+          version: 1,
+          startedAt: oldStartedAt,
+          totals: { requests: 7, ok: 7, totalTokens: 70 },
+        })
+      );
+
+      const loaded = telemetry.initPersistence({ enable: true });
+      assert.equal(loaded.loadedStats, true);
+      const stats = telemetry.getStats();
+      assert.equal(stats.totals.requests, 7, "persisted totals still load");
+      assert.ok(
+        stats.uptimeMs < 60_000,
+        `uptime must restart at process start, got ${stats.uptimeMs} ms`
+      );
+
+      // Resetting stats is not a restart: uptime must not rewind.
+      const beforeReset = telemetry.getStats().uptimeMs;
+      telemetry.resetStats();
+      assert.ok(
+        telemetry.getStats().uptimeMs >= beforeReset,
+        "resetStats must not rewind uptime"
+      );
+    } finally {
+      telemetry.setPersistence(false);
+      if (prevState === undefined) delete process.env.OPENCODE_BRIDGE_STATE_DIR;
+      else process.env.OPENCODE_BRIDGE_STATE_DIR = prevState;
+      if (prevTel === undefined) delete process.env.OPENCODE_TELEMETRY_DIR;
+      else process.env.OPENCODE_TELEMETRY_DIR = prevTel;
+      fs.rmSync(tmpState, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("warp bugfixes", () => {
